@@ -178,10 +178,10 @@ async def refresh_user_tweets_cache(username: str) -> None:
         # Helper function to get correct full_text for tweets
         def get_tweet_text(tweet):
             """Get the appropriate text content for a tweet, handling retweets properly."""
-            if (tweet.type == "Retweet" and
-                tweet.retweeted_tweet and
-                tweet.retweeted_tweet.id in retweet_map):
-                return retweet_map[tweet.retweeted_tweet.id]
+            if tweet.type == "Retweet" and tweet.retweeted_tweet:
+                rid = str(tweet.retweeted_tweet.id)
+                if rid in retweet_map:
+                    return retweet_map[rid]
             return clean_tweet(tweet.full_text)
 
         processed_tweets = [
