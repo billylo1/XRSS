@@ -1,10 +1,13 @@
 """Utility functions for XRSS."""
 
+import asyncio
 import json
 import logging
 import os
+import re
 import sys
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger("xrss")
 
@@ -102,6 +105,218 @@ def setup_logging(level: Optional[str] = None) -> logging.Logger:
 
     logger.setLevel(level or logging.INFO)
     return logger
+
+
+def _is_internal_x_host(hostname: str) -> bool:
+    h = hostname.lower()
+    return h in ("twitter.com", "x.com", "mobile.twitter.com") or h.endswith(".twitter.com")
+
+
+_TCO_HTTP_URL = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
+# Any http(s) URL token in tweet text (expanded links, pics, etc.)
+_HTTP_URL_TOKEN = re.compile(r"https?://[^\s<]+")
+
+
+def rss_title_from_description(description: str) -> str:
+    """
+    RSS <title>: same text as the item body/description but without URL tokens
+    (short t.co links and expanded https URLs).
+    """
+    if not (description or "").strip():
+        return ""
+    out = _HTTP_URL_TOKEN.sub("", description)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def _normalize_scheme(url: str) -> str:
+    u = url.strip().rstrip("/")
+    if u.startswith("http://"):
+        return "https://" + u[len("http://") :]
+    return u
+
+
+def _expanded_if_external(exp: str | None) -> Optional[str]:
+    if not exp or not exp.startswith(("http://", "https://")):
+        return None
+    try:
+        host = urlparse(exp).hostname or ""
+    except ValueError:
+        return None
+    if not host or _is_internal_x_host(host):
+        return None
+    return exp
+
+
+def primary_external_article_url(url_entities: list | None) -> Optional[str]:
+    """
+    First expanded URL that points outside twitter.com / x.com (the linked article).
+    """
+    if not url_entities:
+        return None
+    for ent in url_entities:
+        if not isinstance(ent, dict):
+            continue
+        exp = _expanded_if_external(ent.get("expanded_url") or ent.get("expanded_URL"))
+        if exp:
+            return exp
+    return None
+
+
+def last_external_article_url(url_entities: list | None) -> Optional[str]:
+    """Last non-X expanded_url in entity order (often the trailing t.co target)."""
+    if not url_entities:
+        return None
+    for ent in reversed(url_entities):
+        if not isinstance(ent, dict):
+            continue
+        exp = _expanded_if_external(ent.get("expanded_url") or ent.get("expanded_URL"))
+        if exp:
+            return exp
+    return None
+
+
+def primary_article_url_for_rss(full_text: str, url_entities: list | None) -> Optional[str]:
+    """
+    RSS <link>: use expanded_url for the last https://t.co/... in the tweet text when possible.
+    That is usually the article URL at the end of AP-style posts.
+    """
+    if not url_entities:
+        return None
+
+    if full_text:
+        matches = list(_TCO_HTTP_URL.finditer(full_text))
+        if matches:
+            last_short = matches[-1].group(0)
+            last_norm = _normalize_scheme(last_short)
+            for ent in url_entities:
+                if not isinstance(ent, dict):
+                    continue
+                su = (ent.get("url") or "").strip()
+                if not su:
+                    continue
+                if _normalize_scheme(su) == last_norm:
+                    exp = _expanded_if_external(
+                        ent.get("expanded_url") or ent.get("expanded_URL")
+                    )
+                    if exp:
+                        return exp
+
+    found = last_external_article_url(url_entities)
+    if found:
+        return found
+    return primary_external_article_url(url_entities)
+
+
+def merge_url_entities_for_display(tweet: Any) -> list:
+    """URL entities from retweet original, main tweet, then quote — order for expansion."""
+    merged: list = []
+    if getattr(tweet, "retweeted_tweet", None) and getattr(tweet, "type", None) == "Retweet":
+        merged.extend(getattr(tweet.retweeted_tweet, "urls", None) or [])
+    merged.extend(getattr(tweet, "urls", None) or [])
+    quoted = getattr(tweet, "quoted_tweet", None) or getattr(tweet, "quote", None)
+    if quoted:
+        merged.extend(getattr(quoted, "urls", None) or [])
+    return merged
+
+
+def expand_short_urls_in_text(full_text: str, url_entities: list | None) -> str:
+    """Replace t.co (etc.) with expanded_url in tweet text for RSS description."""
+    if not full_text or not url_entities:
+        return full_text
+    out = full_text
+    for ent in url_entities:
+        if not isinstance(ent, dict):
+            continue
+        short = ent.get("url")
+        exp = ent.get("expanded_url") or ent.get("expanded_URL")
+        if not short or not exp:
+            continue
+        if short in out:
+            out = out.replace(short, exp)
+    return out
+
+
+def _follow_tco_redirect(short_url: str) -> str:
+    """Resolve a t.co URL to its final destination (fallback when entities lack expanded_url)."""
+    try:
+        import requests
+
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; XRSS/0.1; +https://github.com/thytu/XRSS)"}
+        r = requests.head(short_url, allow_redirects=True, timeout=15, headers=headers)
+        if r.status_code >= 400 or not r.url:
+            r = requests.get(short_url, allow_redirects=True, timeout=15, headers=headers, stream=True)
+            try:
+                r.close()
+            except Exception:
+                pass
+        return str(r.url)
+    except Exception:
+        logger.debug("t.co redirect resolve failed for %s", short_url, exc_info=True)
+        return short_url
+
+
+def follow_short_url(short_url: str) -> Optional[str]:
+    """
+    Resolve a short URL (t.co etc.) to its external destination.
+    Returns None if the resolved URL is still on twitter.com / x.com or resolution failed.
+    Intended to be called via asyncio.to_thread from async code.
+    """
+    resolved = _follow_tco_redirect(short_url)
+    if resolved == short_url:
+        return None
+    try:
+        host = urlparse(resolved).hostname or ""
+    except ValueError:
+        return None
+    if not host or _is_internal_x_host(host):
+        return None
+    return resolved
+
+
+def resolve_tco_redirects_in_text(full_text: str) -> tuple[str, Optional[str]]:
+    """
+    Expand remaining t.co links by following redirects.
+    Returns (updated_text, last_external_url) for RSS <link> when entities were incomplete.
+    """
+    if not full_text or "t.co/" not in full_text:
+        return full_text, None
+    matches = list(_TCO_HTTP_URL.finditer(full_text))
+    if not matches:
+        return full_text, None
+
+    cache: dict[str, str] = {}
+    last_external: Optional[str] = None
+    for m in matches:
+        short = m.group(0)
+        if short not in cache:
+            cache[short] = _follow_tco_redirect(short)
+        final = cache[short]
+        try:
+            host = urlparse(final).hostname or ""
+        except ValueError:
+            host = ""
+        if host and not _is_internal_x_host(host):
+            last_external = final
+
+    out = full_text
+    for short, final in cache.items():
+        if short != final:
+            out = out.replace(short, final)
+
+    return out, last_external
+
+
+async def enrich_feed_text_and_article_link(
+    raw_text: str, url_entities: list | None
+) -> tuple[str, Optional[str]]:
+    """
+    Expanded description + external article URL for RSS <link>.
+    Uses API url_entities only — no live HTTP redirect following.
+    """
+    full_text = expand_short_urls_in_text(raw_text, url_entities)
+    article_link = primary_article_url_for_rss(raw_text, url_entities)
+    return full_text, article_link
 
 
 def clean_tweet(tweet: str) -> str:

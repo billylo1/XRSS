@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import random
+import re
 from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -32,9 +33,14 @@ try:
     from utils import (
         clean_cookies,
         clean_tweet,
+        expand_short_urls_in_text,
+        follow_short_url,
         is_cloudflare_block,
         is_connect_error,
         is_redis_connection_error,
+        merge_url_entities_for_display,
+        primary_article_url_for_rss,
+        rss_title_from_description,
         setup_logging,
         summarize_twikit_error,
     )
@@ -43,9 +49,14 @@ except ImportError:
     from .utils import (
         clean_cookies,
         clean_tweet,
+        expand_short_urls_in_text,
+        follow_short_url,
         is_cloudflare_block,
         is_connect_error,
         is_redis_connection_error,
+        merge_url_entities_for_display,
+        primary_article_url_for_rss,
+        rss_title_from_description,
         setup_logging,
         summarize_twikit_error,
     )
@@ -191,6 +202,7 @@ async def refresh_user_tweets_cache(username: str) -> None:
                 "id": tweet.id,
                 "link": f"https://x.com/{username}/status/{tweet.id}",
                 "full_text": get_tweet_text(tweet),
+                "urls": merge_url_entities_for_display(tweet),
                 "in_reply_to": [
                     {
                         "id": _reply.id,
@@ -390,19 +402,33 @@ async def get_feed(
     for username, tweets in tweets_data.items():
         # Get user data from cache
         user_data = await get_cached_user(username)
+        needs_refresh = False
 
         for tweet in tweets:
             fe = fg.add_entry()
-            fe.title(f"{tweet['type']} by {username}")
-            fe.link(href=f"https://twitter.com/{username}/status/{tweet['id']}")
-            fe.description(tweet["full_text"])
+            tweet_url = f"https://twitter.com/{username}/status/{tweet['id']}"
+            if "urls" not in tweet:
+                needs_refresh = True
+            urls = tweet.get("urls") or []
+            description = expand_short_urls_in_text(tweet["full_text"], urls)
+            article_url = primary_article_url_for_rss(tweet["full_text"], urls)
+            if article_url is None:
+                # Fallback: last URL token in text, then resolve via HTTP redirect
+                _m = list(re.finditer(r"https?://\S+", tweet["full_text"]))
+                if _m:
+                    _last_url = _m[-1].group(0).rstrip(".,)")
+                    article_url = await asyncio.to_thread(follow_short_url, _last_url) or _last_url
+            item_title = rss_title_from_description(description) or f"{tweet['type']} by {username}"
+            fe.title(item_title)
+            fe.link(href=article_url or tweet_url)
+            fe.description(description)
             fe.pubDate(
                 datetime.strptime(tweet["created_at"], "%a %b %d %H:%M:%S +0000 %Y").astimezone(
                     ZoneInfo("UTC")
                 )
             )
             fe.author({"name": username})
-            fe.guid(f"https://twitter.com/{username}/status/{tweet['id']}", permalink=True)
+            fe.guid(tweet_url, permalink=True)
 
             # Add profile picture as media content if available
             if user_data and user_data.get("profile_image_url"):
@@ -415,6 +441,9 @@ async def get_feed(
                         "type": "image/jpeg",
                     }
                 )
+
+        if needs_refresh:
+            background_tasks.add_task(refresh_user_tweets_cache, username)
 
     return Response(content=fg.rss_str(), media_type="application/rss+xml")
 

@@ -78,18 +78,104 @@ You'll need:
 
    #### 🛠️ Manual Setup
    ```bash
-   # Create your virtual environment
-   python -m venv venv
+   # From the repository root (after git clone)
+   python3 -m venv venv
    source venv/bin/activate  # Windows: .\venv\Scripts\activate
 
-   # Install what you need
-   pip install .            # Basic setup
-   # OR
-   pip install ".[dev]"    # Developer setup with testing goodies
+   pip install -U pip
+   pip install .             # application
+   # pip install ".[dev]"   # optional: tests and linters
 
-   # Launch!
-   python main.py
+   # Requires Redis (see “Linux: full bare-metal setup” below). Then:
+   uvicorn xrss.main:app --host 0.0.0.0 --port 8000
    ```
+
+### Linux: full bare-metal setup
+
+Use this on a fresh Linux server or workstation when you are **not** using Docker. You need **Python 3.10+**, **Redis**, and network access to **X/Twitter** (see cookies / proxy notes below).
+
+#### 1. System packages
+
+Debian / Ubuntu example:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git redis-server
+sudo systemctl enable redis-server --now   # Redis on localhost:6379
+redis-cli ping                             # expect PONG
+```
+
+Alternatively run only Redis in Docker:
+
+```bash
+docker run -d --name redis -p 6379:6379 redis:alpine
+export REDIS_URL=redis://127.0.0.1:6379
+```
+
+#### 2. Application install
+
+```bash
+git clone https://github.com/billylo1/XRSS.git
+cd XRSS
+python3 -m venv venv
+source venv/bin/activate
+pip install -U pip
+pip install .
+```
+
+Optional: generate **`cookies.json`** on this machine with Playwright (helps when X blocks password login):
+
+```bash
+pip install ".[cookies]"
+playwright install chromium
+playwright install-deps chromium   # Linux system libs for Chromium
+```
+
+On a **headless server** (no monitor / no `DISPLAY`), headed Chromium cannot start unless you use a virtual framebuffer:
+
+```bash
+sudo apt install -y xvfb
+xvfb-run -a python scripts/generate_cookies_playwright.py --manual --browser chromium -o cookies.json
+```
+
+Or run **`--headless`** (often blocked by X login). The script exits early with a hint if headed mode is used without a display.
+
+Use **`--from-export`** with a JSON export from a normal browser if Playwright is blocked or impractical.
+
+#### 3. Configuration
+
+```bash
+cp .env.example .env
+# Edit .env: TWITTER_USERNAME, TWITTER_EMAIL, TWITTER_PASSWORD, REDIS_URL,
+# optional TWITTER_TOTP_SECRET, TWITTER_PROXY, COOKIES_FILE, HOST, PORT
+```
+
+If X or Cloudflare blocks your server’s IP, set **`TWITTER_PROXY`** to an HTTP(S) or SOCKS proxy Twikit can use, or place a valid **`cookies.json`** from a logged-in browser session.
+
+#### 4. Run the service
+
+From the repo root with `venv` activated:
+
+```bash
+set -a && source .env && set +a   # optional: export vars from .env for this shell
+uvicorn xrss.main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
+```
+
+You can skip `source .env` if you only rely on **`python-dotenv`** inside the app: run Uvicorn from the repo root so `.env` is found when modules load.
+
+Check:
+
+- OpenAPI: `http://<host>:<port>/docs`
+- RSS: `http://<host>:<port>/feed.xml`
+
+#### 5. Firewall (optional)
+
+If you expose the service:
+
+```bash
+sudo ufw allow 8000/tcp   # adjust port to match PORT in .env
+sudo ufw reload
+```
 
 ### 🎯 Access Your Feeds
 
@@ -170,6 +256,7 @@ If your Twitter/X account has two-factor authentication enabled, you'll need to 
 | `CACHE_TTL` | `1800` | How long to cache (seconds) |
 | `BACKGROUND_REFRESH_INTERVAL` | `1500` | How often to refresh (seconds) |
 | `COOKIES_FILE` | `cookies.json` | Path to store authentication cookies |
+| `TWITTER_PROXY` | _(unset)_ | HTTP(S) or SOCKS proxy URL for Twikit (when X blocks direct egress) |
 
 ### 🍪 Cookie Storage
 

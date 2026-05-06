@@ -16,6 +16,10 @@ Why Playwright gets blocked: bundled Chromium is easy for X to fingerprint. Pref
 If automation is impossible, export cookies from normal Chrome and convert:
   python scripts/generate_cookies_playwright.py --from-export cookies-export.json
 
+Headless Linux servers have no GUI: use a virtual framebuffer so headed Chromium can run:
+  sudo apt install -y xvfb
+  xvfb-run -a python scripts/generate_cookies_playwright.py --manual ...
+Or pass --headless (often blocked by X login).
 Cookie-export.json can be a JSON array from extensions like "Cookie-Editor" / EditThisCookie,
 or an object already in twikit format.
 
@@ -37,6 +41,33 @@ from dotenv import load_dotenv
 
 
 DEFAULT_PROFILE_DIR = Path(".xrss-playwright-profile")
+
+
+def _gui_environment_hint() -> bool:
+    """True if typical desktop env vars suggest a display is available (Linux/WSL/Linux GUI)."""
+    return bool(
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("SSH_X11_FORWARDING") == "yes"
+    )
+
+
+def _exit_if_headed_without_display(headed: bool) -> None:
+    """Headed Playwright needs an X/Wayland session or xvfb-run on headless Linux."""
+    if not headed:
+        return
+    if sys.platform == "win32" or sys.platform == "darwin":
+        return
+    if _gui_environment_hint():
+        return
+    print(
+        "Headed browser requires a display. On headless Linux use one of:\n"
+        "  sudo apt install -y xvfb && xvfb-run -a python scripts/generate_cookies_playwright.py ...\n"
+        "  python scripts/generate_cookies_playwright.py --headless ...   "
+        "(often blocked by X; prefer --from-export if login fails)\n",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 def _relevant_domain(domain: str) -> bool:
@@ -419,6 +450,7 @@ def main() -> None:
         return
 
     headed = not args.headless
+    _exit_if_headed_without_display(headed)
     profile_dir: Path | None = None if args.ephemeral else args.profile
 
     if args.manual:
