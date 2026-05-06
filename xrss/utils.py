@@ -9,6 +9,79 @@ from typing import Optional
 logger = logging.getLogger("xrss")
 
 
+def is_redis_connection_error(exc: BaseException) -> bool:
+    """Cache/backend unreachable (redis.asyncio client)."""
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        return isinstance(exc, RedisConnectionError)
+    except ImportError:
+        return False
+
+
+def is_cloudflare_block(message: str) -> bool:
+    """Detect Cloudflare bot/HTML block pages embedded in exception messages."""
+    m = message.lower()
+    return (
+        "cloudflare" in m
+        or "cf-ray" in m
+        or "attention required" in m
+        or "sorry, you have been blocked" in m
+    )
+
+
+def is_connect_error(exc: BaseException) -> bool:
+    """TCP/DNS/proxy failures before any HTTP response (e.g. bad TWITTER_PROXY)."""
+    if is_redis_connection_error(exc):
+        return False
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.ConnectError, httpx.ProxyError)):
+            return True
+    except ImportError:
+        pass
+    low = str(exc).lower()
+    return (
+        "all connection attempts failed" in low
+        or "connection refused" in low
+        or "could not resolve host" in low
+        or "name or service not known" in low
+        or "network is unreachable" in low
+        or "nodename nor servname" in low
+    )
+
+
+def summarize_twikit_error(exc: BaseException) -> str:
+    """Short log/API message; avoids dumping multi-page HTML from X/Cloudflare."""
+    msg = str(exc)
+    if is_redis_connection_error(exc):
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        return (
+            f"Redis is not reachable ({redis_url}). Start Redis "
+            "(e.g. `brew services start redis` or `docker run -p 6379:6379 redis`), "
+            "or set REDIS_URL to a running server."
+        )
+    if is_cloudflare_block(msg):
+        return (
+            "X.com returned a Cloudflare block (403) for this client or network. "
+            "Try a cookies.json from a logged-in browser session, set TWITTER_PROXY to a proxy "
+            "X accepts, or use a different network/IP."
+        )
+    if is_connect_error(exc):
+        hint = (
+            "Could not connect to x.com or your proxy (TCP/DNS). "
+            "If TWITTER_PROXY is set, fix scheme (http:// or socks5://), host, port, and auth, "
+            "or unset TWITTER_PROXY to try a direct connection."
+        )
+        if os.getenv("TWITTER_PROXY"):
+            hint += " Verify the proxy is reachable from this machine."
+        return hint
+    if len(msg) > 1200:
+        return msg[:1200] + "… [truncated]"
+    return msg
+
+
 def setup_logging(level: Optional[str] = None) -> logging.Logger:
     """
     Set up logging configuration.

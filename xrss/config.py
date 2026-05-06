@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     twitter_password: str
     twitter_totp_secret: Optional[str] = None
 
+    # Optional HTTP proxy for twikit when X/Cloudflare blocks your IP (set TWITTER_PROXY in env)
+    twitter_proxy: Optional[str] = None
+
     # Redis configuration
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     cache_ttl: int = int(os.getenv("CACHE_TTL", 1800))  # 30 minutes

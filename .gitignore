@@ -171,4 +171,8 @@ cython_debug/
 .pypirc
 
 cookies.json
+
+# Playwright persistent browser profile (scripts/generate_cookies_playwright.py)
+.xrss-playwright-profile/
+
 .DS_Store

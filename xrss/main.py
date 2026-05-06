@@ -18,11 +18,37 @@ from twikit import Tweet as TwikitTweet
 from twikit import UserNotFound
 
 try:
+    from .twikit_transaction_patch import apply_twikit_transaction_patch
+    from .twikit_user_patch import apply_twikit_user_patch
+except ImportError:
+    from twikit_transaction_patch import apply_twikit_transaction_patch
+    from twikit_user_patch import apply_twikit_user_patch
+
+apply_twikit_transaction_patch()
+apply_twikit_user_patch()
+
+try:
     from config import Settings
-    from utils import clean_cookies, clean_tweet, setup_logging
+    from utils import (
+        clean_cookies,
+        clean_tweet,
+        is_cloudflare_block,
+        is_connect_error,
+        is_redis_connection_error,
+        setup_logging,
+        summarize_twikit_error,
+    )
 except ImportError:
     from .config import Settings
-    from .utils import clean_cookies, clean_tweet, setup_logging
+    from .utils import (
+        clean_cookies,
+        clean_tweet,
+        is_cloudflare_block,
+        is_connect_error,
+        is_redis_connection_error,
+        setup_logging,
+        summarize_twikit_error,
+    )
 
 
 # Load environment variables
@@ -34,6 +60,7 @@ settings = Settings(
     twitter_email=os.getenv("TWITTER_EMAIL"),
     twitter_password=os.getenv("TWITTER_PASSWORD"),
     twitter_totp_secret=os.getenv("TWITTER_TOTP_SECRET"),
+    twitter_proxy=os.getenv("TWITTER_PROXY") or None,
 )
 
 # Setup logging
@@ -49,7 +76,7 @@ app = FastAPI(
 )
 
 # Initialize clients
-twikit_client = TwikitClient("en-US")
+twikit_client = TwikitClient("en-US", proxy=settings.twitter_proxy)
 redis = aioredis.from_url(settings.redis_url, decode_responses=True)
 
 # Rate limiting configuration
@@ -125,21 +152,28 @@ async def refresh_user_tweets_cache(username: str) -> None:
             reverse=True,
         )
 
-        # By default retweet's full_text is actually not full lol
-        # First pass: mark tweet types and collect retweet IDs
-        retweet_tasks = []
+        # By default retweet's full_text is actually not full lol — fetch originals by ID.
+        # Use get_tweets_by_ids (GQL) instead of get_tweet_by_id; tweet-detail responses often
+        # omit content.itemContent and break twikit's parser (2025–2026 X API drift).
+        retweet_source_ids: List[str] = []
+        seen_rid: set[str] = set()
         for tweet in all_tweets:
             setattr(tweet, "type", _get_tweet_type(tweet))
-            if tweet.type == "Retweet":
-                retweet_tasks.append(
-                    rate_limited_request(twikit_client.get_tweet_by_id(tweet.retweeted_tweet.id))
-                )
+            if tweet.type == "Retweet" and tweet.retweeted_tweet:
+                rid = str(tweet.retweeted_tweet.id)
+                if rid not in seen_rid:
+                    seen_rid.add(rid)
+                    retweet_source_ids.append(rid)
 
-        # Fetch all retweets in parallel
-        retweet_map = {}
-        if retweet_tasks:
-            retweet_results = await asyncio.gather(*retweet_tasks)
-            retweet_map = {tweet.id: clean_tweet(tweet.full_text) for tweet in retweet_results}
+        retweet_map: Dict[str, str] = {}
+        if retweet_source_ids:
+            chunk_size = 50
+            for i in range(0, len(retweet_source_ids), chunk_size):
+                chunk = retweet_source_ids[i : i + chunk_size]
+                originals = await rate_limited_request(twikit_client.get_tweets_by_ids(chunk))
+                for orig in originals:
+                    if orig is not None:
+                        retweet_map[str(orig.id)] = clean_tweet(orig.full_text)
 
         # Helper function to get correct full_text for tweets
         def get_tweet_text(tweet):
@@ -299,7 +333,16 @@ async def get_tweets(
         return result
 
     except Exception as e:
-        logger.error(f"Error in get_tweets: {str(e)}")
+        logger.error(f"Error in get_tweets: {summarize_twikit_error(e)}")
+        if (
+            is_redis_connection_error(e)
+            or is_cloudflare_block(str(e))
+            or is_connect_error(e)
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=summarize_twikit_error(e),
+            ) from e
         raise
 
 
